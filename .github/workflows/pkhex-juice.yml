@@ -1,11 +1,11 @@
-name: Build PKHeX for Juice
+name: Build PKHeX for Juice ARM64
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -14,42 +14,90 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Build self-contained ARM64 PKHeX
+      - name: Publish PKHeX ARM64
+        shell: pwsh
         run: |
-          dotnet publish PKHeX.WinForms/PKHeX.WinForms.csproj \
-            -c Release \
-            -r win-arm64 \
-            --self-contained true \
-            -p:RuntimeIdentifier=win-arm64 \
-            -p:PublishSingleFile=false \
-            -p:PublishReadyToRun=false \
+          dotnet publish PKHeX.WinForms/PKHeX.WinForms.csproj `
+            -c Release `
+            -r win-arm64 `
+            --self-contained true `
+            -p:RuntimeIdentifier=win-arm64 `
+            -p:PublishSingleFile=false `
+            -p:PublishReadyToRun=false `
             -o PKHeX-Juice
 
-      - name: Limit .NET GC virtual address reservation
+      - name: Limit .NET GC reservation
+        shell: pwsh
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
+          $path = "PKHeX-Juice\PKHeX.runtimeconfig.json"
+          $json = Get-Content $path -Raw | ConvertFrom-Json
 
-          p = Path("PKHeX-Juice/PKHeX.runtimeconfig.json")
-          data = json.loads(p.read_text())
+          if (-not $json.runtimeOptions.configProperties) {
+            $json.runtimeOptions | Add-Member `
+              -MemberType NoteProperty `
+              -Name configProperties `
+              -Value ([PSCustomObject]@{})
+          }
 
-          props = (
-              data.setdefault("runtimeOptions", {})
-                  .setdefault("configProperties", {})
-          )
+          $json.runtimeOptions.configProperties |
+            Add-Member `
+              -MemberType NoteProperty `
+              -Name "System.GC.RegionRange" `
+              -Value 1073741824 `
+              -Force
 
-          # 1 GiB virtual GC region range instead of ~7.6 GiB
-          props["System.GC.RegionRange"] = 1073741824
+          $json | ConvertTo-Json -Depth 20 | Set-Content $path
 
-          p.write_text(json.dumps(data, indent=2))
-          print(p.read_text())
-          PY
+      - name: Add ARM64 Universal CRT
+        shell: pwsh
+        run: |
+          $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Redist"
 
-      - name: Zip
-        run: zip -r PKHeX-Juice.zip PKHeX-Juice
+          Write-Host "Searching for ARM64 Universal CRT under $root"
+
+          $ucrtbase = Get-ChildItem $root `
+            -Recurse `
+            -Filter ucrtbase.dll `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.DirectoryName -match "\\arm64$"
+            } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $ucrtbase) {
+            throw "Could not find ARM64 ucrtbase.dll in Windows SDK."
+          }
+
+          $ucrtDir = $ucrtbase.DirectoryName
+
+          Write-Host "Using UCRT directory:"
+          Write-Host $ucrtDir
+
+          Copy-Item "$ucrtDir\*.dll" "PKHeX-Juice\" -Force
+
+          Write-Host "Copied UCRT DLLs:"
+          Get-ChildItem "PKHeX-Juice\api-ms-win-crt-*.dll"
+          Get-ChildItem "PKHeX-Juice\ucrtbase.dll"
+
+      - name: Verify ARM64 build contents
+        shell: pwsh
+        run: |
+          Write-Host "Runtime config:"
+          Get-Content "PKHeX-Juice\PKHeX.runtimeconfig.json"
+
+          Write-Host "UCRT DLL count:"
+          (Get-ChildItem "PKHeX-Juice\api-ms-win-crt-*.dll").Count
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path PKHeX-Juice `
+            -DestinationPath PKHeX-Juice-ARM64.zip `
+            -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PKHeX-Juice
-          path: PKHeX-Juice.zip
+          name: PKHeX-Juice-ARM64
+          path: PKHeX-Juice-ARM64.zip
