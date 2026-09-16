@@ -24,6 +24,27 @@ jobs:
             -p:PublishReadyToRun=false \
             -o PKHeX-Juice
 
+      - name: Limit .NET GC virtual address reservation
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("PKHeX-Juice/PKHeX.runtimeconfig.json")
+          data = json.loads(p.read_text())
+
+          props = (
+              data.setdefault("runtimeOptions", {})
+                  .setdefault("configProperties", {})
+          )
+
+          # 1 GiB virtual GC region range instead of ~7.6 GiB
+          props["System.GC.RegionRange"] = 1073741824
+
+          p.write_text(json.dumps(data, indent=2))
+          print(p.read_text())
+          PY
+
       - name: Zip
         run: zip -r PKHeX-Juice.zip PKHeX-Juice
 
