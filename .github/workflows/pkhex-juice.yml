@@ -1,0 +1,33 @@
+name: Build PKHeX for Juice
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build self-contained PKHeX
+        run: |
+          dotnet publish PKHeX.WinForms/PKHeX.WinForms.csproj \
+            -c Release \
+            -r win-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -p:PublishReadyToRun=false \
+            -o PKHeX-Juice
+
+      - name: Zip
+        run: zip -r PKHeX-Juice.zip PKHeX-Juice
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PKHeX-Juice
+          path: PKHeX-Juice.zip
