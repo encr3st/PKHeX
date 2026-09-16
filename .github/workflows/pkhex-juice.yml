@@ -14,12 +14,13 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Build self-contained PKHeX
+      - name: Build self-contained ARM64 PKHeX
         run: |
           dotnet publish PKHeX.WinForms/PKHeX.WinForms.csproj \
             -c Release \
-            -r win-x64 \
+            -r win-arm64 \
             --self-contained true \
+            -p:RuntimeIdentifier=win-arm64 \
             -p:PublishSingleFile=false \
             -p:PublishReadyToRun=false \
             -o PKHeX-Juice
