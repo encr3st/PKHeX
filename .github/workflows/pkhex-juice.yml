@@ -5,27 +5,27 @@ on:
 
 jobs:
   build:
-    name: Build PKHeX ARM64
+    name: Build PKHeX ARM64 for Juice
     runs-on: windows-latest
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Check out PKHeX
-      # ------------------------------------------------------------
+      # ============================================================
+      # 1. Checkout PKHeX
+      # ============================================================
       - name: Checkout PKHeX
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 2. Install .NET 10
-      # ------------------------------------------------------------
+      # ============================================================
+      # 2. Install .NET 10 SDK
+      # ============================================================
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
 
-      # ------------------------------------------------------------
-      # 3. Install Python for PE patching
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. Install Python for PE import patching
+      # ============================================================
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -37,9 +37,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pefile
 
-      # ------------------------------------------------------------
-      # 4. Publish PKHeX as self-contained Windows ARM64
-      # ------------------------------------------------------------
+      # ============================================================
+      # 4. Configure MSVC for Windows ARM64 cross-compilation.
+      #
+      # GitHub's runner itself is x64, but MSVC can produce ARM64
+      # Windows binaries.
+      # ============================================================
+      - name: Setup MSVC ARM64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      # ============================================================
+      # 5. Publish PKHeX as self-contained Windows ARM64
+      # ============================================================
       - name: Publish PKHeX ARM64
         shell: pwsh
         run: |
@@ -57,14 +68,15 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "ARM64 publish completed."
+          Write-Host "PKHeX ARM64 publish completed."
 
-      # ------------------------------------------------------------
-      # 5. Reduce .NET GC virtual-address reservation
+      # ============================================================
+      # 6. Keep the 1 GiB GC region-range workaround.
       #
-      # Retains the workaround from the earlier x64/CoreCLR problem.
-      # ------------------------------------------------------------
-      - name: Configure .NET GC for Juice
+      # runtimeconfig.json uses a DECIMAL value.
+      # 1073741824 = 1 GiB.
+      # ============================================================
+      - name: Configure .NET GC
         shell: pwsh
         run: |
           $path = "PKHeX-Juice\PKHeX.runtimeconfig.json"
@@ -74,6 +86,10 @@ jobs:
           }
 
           $json = Get-Content $path -Raw | ConvertFrom-Json
+
+          if (-not $json.runtimeOptions) {
+            throw "runtimeOptions is missing."
+          }
 
           if (-not $json.runtimeOptions.configProperties) {
             $json.runtimeOptions |
@@ -95,32 +111,26 @@ jobs:
             Set-Content $path -Encoding UTF8
 
           Write-Host ""
-          Write-Host "Updated runtime configuration:"
+          Write-Host "Final runtimeconfig:"
           Get-Content $path
 
-      # ------------------------------------------------------------
-      # 6. Patch UCRT API-set imports
+      # ============================================================
+      # 7. Patch api-ms-win-crt-* imports.
       #
-      # Juice/Grape is failing its API-set schema resolution.
+      # Juice/Grape is failing API-set resolution.
+      # Wine normally maps these CRT contracts to ucrtbase.dll.
       #
-      # Wine's own API-set table maps all api-ms-win-crt-* contracts
-      # to ucrtbase.dll, so we perform that mapping directly in the
-      # PE import tables.
-      #
-      # This patches ALL EXEs and DLLs in the self-contained publish,
-      # not just PKHeX.exe, because hostfxr/coreclr/etc. may also
-      # reference UCRT API-set names.
-      # ------------------------------------------------------------
+      # We rewrite those DLL names directly inside the PE import
+      # tables.
+      # ============================================================
       - name: Patch UCRT imports for Juice
         shell: pwsh
         run: |
           @'
           from pathlib import Path
           import pefile
-          import sys
 
           ROOT = Path("PKHeX-Juice")
-
           PREFIX = b"api-ms-win-crt-"
           REPLACEMENT = b"ucrtbase.dll"
 
@@ -131,26 +141,20 @@ jobs:
           def patch_name(pe, rva, old_name, path, kind):
               global patched_imports
 
-              if rva is None:
-                  return False
-
               if not old_name.lower().startswith(PREFIX):
                   return False
 
-              # Include the terminating NUL belonging to the
-              # original DLL name.
               available = len(old_name) + 1
-
-              replacement = (
-                  REPLACEMENT +
-                  b"\x00" * (available - len(REPLACEMENT))
-              )
 
               if len(REPLACEMENT) + 1 > available:
                   raise RuntimeError(
-                      f"Replacement will not fit in {path}: "
-                      f"{old_name!r}"
+                      f"Replacement does not fit in {path}: {old_name!r}"
                   )
+
+              replacement = (
+                  REPLACEMENT
+                  + b"\x00" * (available - len(REPLACEMENT))
+              )
 
               print(
                   f"{path.name}: [{kind}] "
@@ -164,8 +168,8 @@ jobs:
 
 
           pe_files = sorted(
-              list(ROOT.rglob("*.exe")) +
-              list(ROOT.rglob("*.dll"))
+              list(ROOT.rglob("*.exe"))
+              + list(ROOT.rglob("*.dll"))
           )
 
           print(f"Scanning {len(pe_files)} PE files...")
@@ -179,53 +183,38 @@ jobs:
 
               changed = False
 
-              # -------------------------------
-              # Normal import directory
-              # -------------------------------
+              # Normal imports
               if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
                   for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                      name = entry.dll
-
-                      if not name:
-                          continue
+                      name = entry.dll or b""
 
                       if name.lower().startswith(PREFIX):
-                          rva = int(entry.struct.Name)
-
                           if patch_name(
                               pe,
-                              rva,
+                              int(entry.struct.Name),
                               name,
                               path,
-                              "IMPORT"
+                              "IMPORT",
                           ):
                               changed = True
 
-              # -------------------------------
-              # Delay-load import directory
-              # -------------------------------
+              # Delay-load imports
               if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
                   for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
-                      name = entry.dll
-
-                      if not name:
-                          continue
+                      name = entry.dll or b""
 
                       if not name.lower().startswith(PREFIX):
                           continue
 
                       name_value = int(entry.struct.szName)
-
-                      # Modern delay-import descriptors normally
-                      # contain RVAs when bit 0 of grAttrs is set.
                       attrs = int(entry.struct.grAttrs)
 
                       if attrs & 1:
                           rva = name_value
                       else:
                           rva = (
-                              name_value -
-                              int(pe.OPTIONAL_HEADER.ImageBase)
+                              name_value
+                              - int(pe.OPTIONAL_HEADER.ImageBase)
                           )
 
                       if patch_name(
@@ -233,7 +222,7 @@ jobs:
                           rva,
                           name,
                           path,
-                          "DELAY"
+                          "DELAY",
                       ):
                           changed = True
 
@@ -245,22 +234,22 @@ jobs:
 
           print()
           print(
-              f"Patched {patched_imports} UCRT imports "
+              f"Patched {patched_imports} imports "
               f"across {patched_files} PE files."
           )
 
           if patched_imports == 0:
               raise RuntimeError(
-                  "No api-ms-win-crt imports were found to patch."
+                  "No api-ms-win-crt imports were found."
               )
           '@ | Set-Content patch_ucrt.py -Encoding UTF8
 
           python patch_ucrt.py
 
-      # ------------------------------------------------------------
-      # 7. Verify no api-ms-win-crt imports remain
-      # ------------------------------------------------------------
-      - name: Verify patched imports
+      # ============================================================
+      # 8. Verify the API-set patch.
+      # ============================================================
+      - name: Verify patched UCRT imports
         shell: pwsh
         run: |
           @'
@@ -268,18 +257,16 @@ jobs:
           import pefile
           import sys
 
-          ROOT = Path("PKHeX-Juice")
-          PREFIX = b"api-ms-win-crt-"
+          root = Path("PKHeX-Juice")
+          prefix = b"api-ms-win-crt-"
 
           leftovers = []
-          ucrt_imports = []
+          ucrt_users = []
 
-          pe_files = sorted(
-              list(ROOT.rglob("*.exe")) +
-              list(ROOT.rglob("*.dll"))
-          )
-
-          for path in pe_files:
+          for path in sorted(
+              list(root.rglob("*.exe"))
+              + list(root.rglob("*.dll"))
+          ):
               try:
                   pe = pefile.PE(str(path), fast_load=False)
               except Exception:
@@ -290,86 +277,344 @@ jobs:
                       name = entry.dll or b""
                       low = name.lower()
 
-                      if low.startswith(PREFIX):
+                      if low.startswith(prefix):
                           leftovers.append(
                               (path.name, name.decode(errors="replace"))
                           )
 
                       if low == b"ucrtbase.dll":
-                          ucrt_imports.append(path.name)
+                          ucrt_users.append(path.name)
 
               if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
                   for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
                       name = entry.dll or b""
                       low = name.lower()
 
-                      if low.startswith(PREFIX):
+                      if low.startswith(prefix):
                           leftovers.append(
                               (path.name, name.decode(errors="replace"))
                           )
 
                       if low == b"ucrtbase.dll":
-                          ucrt_imports.append(path.name)
+                          ucrt_users.append(path.name)
 
               pe.close()
 
-          print()
-          print("Files now importing ucrtbase.dll:")
-          for name in sorted(set(ucrt_imports)):
-              print(f"  {name}")
-
-          print()
-
           if leftovers:
-              print("ERROR: Remaining api-ms-win-crt imports:")
+              print("Remaining api-ms-win-crt imports:")
 
-              for file, dll in leftovers:
-                  print(f"  {file}: {dll}")
+              for filename, dll in leftovers:
+                  print(f"  {filename}: {dll}")
 
               sys.exit(1)
 
-          if not ucrt_imports:
-              print("ERROR: No ucrtbase.dll imports found after patch.")
-              sys.exit(1)
+          print("Files importing ucrtbase.dll:")
 
-          print("SUCCESS: No api-ms-win-crt imports remain.")
+          for filename in sorted(set(ucrt_users)):
+              print(f"  {filename}")
+
+          print()
+          print("SUCCESS: api-ms-win-crt imports are patched.")
           '@ | Set-Content verify_ucrt.py -Encoding UTF8
 
           python verify_ucrt.py
 
-      # ------------------------------------------------------------
-      # 8. Verify PKHeX.exe is ARM64
-      # ------------------------------------------------------------
-      - name: Verify PKHeX architecture
+      # ============================================================
+      # 9. Build a tiny native ARM64 launcher.
+      #
+      # IMPORTANT:
+      #
+      # This launcher contains NO C runtime dependency.
+      # It links only against kernel32.dll.
+      #
+      # It sets:
+      #
+      #   DOTNET_PELoader_DisableMapping=1
+      #   DOTNET_ReadyToRun=0
+      #   DOTNET_GCRegionRange=40000000
+      #
+      # and then starts PKHeX.exe.
+      #
+      # DOTNET_GCRegionRange uses hexadecimal:
+      #
+      #   0x40000000 = 1 GiB
+      # ============================================================
+      - name: Build ARM64 Juice launcher
+        shell: pwsh
+        run: |
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+
+          __declspec(noreturn)
+          void WINAPI LauncherEntry(void)
+          {
+              WCHAR path[32768];
+              static const WCHAR target[] = L"PKHeX.exe";
+
+              DWORD length;
+              DWORD pos;
+              DWORD j;
+
+              STARTUPINFOW startup;
+              PROCESS_INFORMATION process;
+              DWORD exitCode = 255;
+
+              /*
+               * Get path to this launcher.
+               */
+              length = GetModuleFileNameW(
+                  NULL,
+                  path,
+                  32768
+              );
+
+              if (length == 0 || length >= 32768)
+                  ExitProcess(101);
+
+              /*
+               * Find the directory portion.
+               */
+              pos = length;
+
+              while (pos > 0)
+              {
+                  WCHAR c = path[pos - 1];
+
+                  if (c == L'\\' || c == L'/')
+                      break;
+
+                  --pos;
+              }
+
+              if (pos == 0)
+                  ExitProcess(102);
+
+              /*
+               * Replace launcher filename with PKHeX.exe.
+               */
+              j = 0;
+
+              while (target[j] != L'\0')
+              {
+                  if ((pos + j + 1) >= 32768)
+                      ExitProcess(103);
+
+                  path[pos + j] = target[j];
+                  ++j;
+              }
+
+              path[pos + j] = L'\0';
+
+              /*
+               * CoreCLR experiment #1:
+               *
+               * Disable file-backed PE mapping for non-OS layouts.
+               */
+              if (!SetEnvironmentVariableW(
+                      L"DOTNET_PELoader_DisableMapping",
+                      L"1"))
+              {
+                  ExitProcess(110);
+              }
+
+              /*
+               * CoreCLR experiment #2:
+               *
+               * Don't consume ReadyToRun framework code.
+               * Force framework methods through the JIT.
+               */
+              if (!SetEnvironmentVariableW(
+                      L"DOTNET_ReadyToRun",
+                      L"0"))
+              {
+                  ExitProcess(111);
+              }
+
+              /*
+               * Keep GC virtual reservation capped at 1 GiB.
+               *
+               * Environment form is hexadecimal.
+               */
+              if (!SetEnvironmentVariableW(
+                      L"DOTNET_GCRegionRange",
+                      L"40000000"))
+              {
+                  ExitProcess(112);
+              }
+
+              /*
+               * Get a correctly initialized STARTUPINFO structure
+               * without using the C runtime.
+               */
+              GetStartupInfoW(&startup);
+
+              /*
+               * Start the real PKHeX apphost.
+               *
+               * Environment variables set above are inherited by
+               * the child automatically.
+               */
+              if (!CreateProcessW(
+                      path,
+                      NULL,
+                      NULL,
+                      NULL,
+                      FALSE,
+                      0,
+                      NULL,
+                      NULL,
+                      &startup,
+                      &process))
+              {
+                  ExitProcess(120);
+              }
+
+              /*
+               * Keep launcher alive until PKHeX exits.
+               */
+              WaitForSingleObject(
+                  process.hProcess,
+                  INFINITE
+              );
+
+              GetExitCodeProcess(
+                  process.hProcess,
+                  &exitCode
+              );
+
+              CloseHandle(process.hThread);
+              CloseHandle(process.hProcess);
+
+              ExitProcess(exitCode);
+          }
+          '@ | Set-Content juice_launcher.c -Encoding ASCII
+
+          Write-Host "Compiling ARM64 launcher..."
+
+          cl.exe `
+            /nologo `
+            /c `
+            /O2 `
+            /GS- `
+            /Zl `
+            /DUNICODE `
+            /D_UNICODE `
+            /DWIN32_LEAN_AND_MEAN `
+            juice_launcher.c `
+            /Fo:juice_launcher.obj
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ARM64 launcher compilation failed."
+          }
+
+          Write-Host ""
+          Write-Host "Linking ARM64 launcher..."
+
+          link.exe `
+            /nologo `
+            /machine:arm64 `
+            /subsystem:windows `
+            /nodefaultlib `
+            /entry:LauncherEntry `
+            juice_launcher.obj `
+            kernel32.lib `
+            /out:PKHeX-Juice\START-PKHeX.exe
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ARM64 launcher link failed."
+          }
+
+          if (-not (Test-Path "PKHeX-Juice\START-PKHeX.exe")) {
+            throw "START-PKHeX.exe was not created."
+          }
+
+          Write-Host ""
+          Write-Host "Launcher created:"
+          Get-Item "PKHeX-Juice\START-PKHeX.exe" |
+            Select-Object Name, Length
+
+      # ============================================================
+      # 10. Verify launcher and PKHeX are ARM64.
+      #
+      # Also make sure the launcher did NOT accidentally gain a
+      # Universal CRT dependency.
+      # ============================================================
+      - name: Verify ARM64 binaries
         shell: pwsh
         run: |
           @'
           import pefile
+          import sys
 
-          pe = pefile.PE("PKHeX-Juice/PKHeX.exe")
+          files = [
+              "PKHeX-Juice/PKHeX.exe",
+              "PKHeX-Juice/START-PKHeX.exe",
+          ]
 
-          machine = pe.FILE_HEADER.Machine
+          for path in files:
+              pe = pefile.PE(path)
 
-          print(f"PKHeX.exe machine: 0x{machine:04X}")
+              machine = pe.FILE_HEADER.Machine
 
-          # IMAGE_FILE_MACHINE_ARM64
-          if machine != 0xAA64:
-              raise RuntimeError(
-                  f"PKHeX.exe is not ARM64: 0x{machine:04X}"
+              print(
+                  f"{path}: machine=0x{machine:04X}"
               )
 
-          print("PKHeX.exe is ARM64.")
+              if machine != 0xAA64:
+                  raise RuntimeError(
+                      f"{path} is not ARM64."
+                  )
+
+              imports = []
+
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      imports.append(
+                          entry.dll.decode(
+                              errors="replace"
+                          )
+                      )
+
+              print(
+                  f"{path} imports:"
+              )
+
+              for dll in imports:
+                  print(f"  {dll}")
+
+              if path.endswith("START-PKHeX.exe"):
+                  bad = [
+                      dll
+                      for dll in imports
+                      if dll.lower().startswith(
+                          "api-ms-win-crt-"
+                      )
+                  ]
+
+                  if bad:
+                      raise RuntimeError(
+                          "Launcher unexpectedly imports "
+                          "Universal CRT API-set DLLs: "
+                          + ", ".join(bad)
+                      )
+
+              pe.close()
+
+          print()
+          print("ARM64 verification passed.")
           '@ | Set-Content verify_arch.py -Encoding UTF8
 
           python verify_arch.py
 
-      # ------------------------------------------------------------
-      # 9. Verify essential .NET files
-      # ------------------------------------------------------------
-      - name: Verify publish contents
+      # ============================================================
+      # 11. Verify all essential files.
+      # ============================================================
+      - name: Verify package contents
         shell: pwsh
         run: |
           $required = @(
+            "START-PKHeX.exe",
             "PKHeX.exe",
             "PKHeX.dll",
             "PKHeX.runtimeconfig.json",
@@ -390,9 +635,27 @@ jobs:
             Write-Host "OK: $file"
           }
 
-      # ------------------------------------------------------------
-      # 10. Create ZIP
-      # ------------------------------------------------------------
+      # ============================================================
+      # 12. Optional: remove createdump.exe.
+      #
+      # We don't need .NET's crash-dump utility inside Juice and
+      # removing it makes the executable picker less confusing.
+      # ============================================================
+      - name: Remove unnecessary createdump
+        shell: pwsh
+        run: |
+          $createdump = "PKHeX-Juice\createdump.exe"
+
+          if (Test-Path $createdump) {
+            Remove-Item $createdump -Force
+            Write-Host "Removed createdump.exe"
+          } else {
+            Write-Host "createdump.exe was not present."
+          }
+
+      # ============================================================
+      # 13. Create the ZIP for Juice.
+      # ============================================================
       - name: Create Juice ZIP
         shell: pwsh
         run: |
@@ -412,12 +675,13 @@ jobs:
           }
 
           Write-Host ""
+          Write-Host "Created:"
           Get-Item $zip |
             Select-Object Name, Length
 
-      # ------------------------------------------------------------
-      # 11. Verify ZIP after extraction
-      # ------------------------------------------------------------
+      # ============================================================
+      # 14. Extract the ZIP again and verify the final artifact.
+      # ============================================================
       - name: Verify final ZIP
         shell: pwsh
         run: |
@@ -432,22 +696,39 @@ jobs:
             -DestinationPath $verify `
             -Force
 
-          $exe = Get-ChildItem `
-            $verify `
-            -Recurse `
-            -Filter "PKHeX.exe"
+          $launcher = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "START-PKHeX.exe"
+          )
 
-          $coreclr = Get-ChildItem `
-            $verify `
-            -Recurse `
-            -Filter "coreclr.dll"
+          $pkhex = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "PKHeX.exe"
+          )
+
+          $coreclr = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "coreclr.dll"
+          )
 
           Write-Host ""
-          Write-Host "Final ZIP:"
-          Write-Host "PKHeX.exe count: $($exe.Count)"
-          Write-Host "coreclr.dll count: $($coreclr.Count)"
+          Write-Host "Final ZIP verification:"
+          Write-Host "START-PKHeX.exe: $($launcher.Count)"
+          Write-Host "PKHeX.exe:       $($pkhex.Count)"
+          Write-Host "coreclr.dll:     $($coreclr.Count)"
+          Write-Host ""
 
-          if ($exe.Count -ne 1) {
+          if ($launcher.Count -ne 1) {
+            throw "START-PKHeX.exe missing from ZIP."
+          }
+
+          if ($pkhex.Count -ne 1) {
             throw "PKHeX.exe missing from ZIP."
           }
 
@@ -455,11 +736,11 @@ jobs:
             throw "coreclr.dll missing from ZIP."
           }
 
-          Write-Host "ZIP verification passed."
+          Write-Host "Final ZIP verification passed."
 
-      # ------------------------------------------------------------
-      # 12. Upload
-      # ------------------------------------------------------------
+      # ============================================================
+      # 15. Upload final artifact.
+      # ============================================================
       - name: Upload PKHeX Juice ARM64
         uses: actions/upload-artifact@v4
         with:
