@@ -5,15 +5,27 @@ on:
 
 jobs:
   build:
+    name: Build PKHeX ARM64
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # ------------------------------------------------------------
+      # 1. Check out PKHeX source
+      # ------------------------------------------------------------
+      - name: Checkout PKHeX
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v5
+      # ------------------------------------------------------------
+      # 2. Install .NET 10 SDK
+      # ------------------------------------------------------------
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
 
+      # ------------------------------------------------------------
+      # 3. Publish PKHeX as self-contained Windows ARM64
+      # ------------------------------------------------------------
       - name: Publish PKHeX ARM64
         shell: pwsh
         run: |
@@ -26,17 +38,43 @@ jobs:
             -p:PublishReadyToRun=false `
             -o PKHeX-Juice
 
-      - name: Limit .NET GC reservation
+          if (-not (Test-Path "PKHeX-Juice\PKHeX.exe")) {
+            throw "PKHeX.exe was not created."
+          }
+
+          Write-Host ""
+          Write-Host "Publish completed."
+          Write-Host "Files in output:"
+          Get-ChildItem "PKHeX-Juice" |
+            Select-Object Name, Length
+
+      # ------------------------------------------------------------
+      # 4. Reduce .NET GC virtual address reservation
+      #
+      # This is the workaround for the earlier CoreCLR startup
+      # failure caused by a very large GC virtual-memory reservation.
+      # ------------------------------------------------------------
+      - name: Configure .NET GC for Juice
         shell: pwsh
         run: |
           $path = "PKHeX-Juice\PKHeX.runtimeconfig.json"
+
+          if (-not (Test-Path $path)) {
+            throw "PKHeX.runtimeconfig.json was not found."
+          }
+
           $json = Get-Content $path -Raw | ConvertFrom-Json
 
+          if (-not $json.runtimeOptions) {
+            throw "runtimeOptions is missing from runtimeconfig."
+          }
+
           if (-not $json.runtimeOptions.configProperties) {
-            $json.runtimeOptions | Add-Member `
-              -MemberType NoteProperty `
-              -Name configProperties `
-              -Value ([PSCustomObject]@{})
+            $json.runtimeOptions |
+              Add-Member `
+                -MemberType NoteProperty `
+                -Name configProperties `
+                -Value ([PSCustomObject]@{})
           }
 
           $json.runtimeOptions.configProperties |
@@ -46,58 +84,243 @@ jobs:
               -Value 1073741824 `
               -Force
 
-          $json | ConvertTo-Json -Depth 20 | Set-Content $path
+          $json |
+            ConvertTo-Json -Depth 20 |
+            Set-Content $path -Encoding UTF8
 
+          Write-Host ""
+          Write-Host "Updated runtime configuration:"
+          Get-Content $path
+
+      # ------------------------------------------------------------
+      # 5. Find Microsoft's ARM64 Universal CRT redistributable
+      #    inside the Windows SDK installed on the GitHub runner.
+      #
+      # Expected directory looks roughly like:
+      #
+      # C:\Program Files (x86)\Windows Kits\10\Redist\<version>\
+      #     ucrt\DLLs\arm64
+      # ------------------------------------------------------------
       - name: Add ARM64 Universal CRT
         shell: pwsh
         run: |
           $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Redist"
 
-          Write-Host "Searching for ARM64 Universal CRT under $root"
+          Write-Host "Searching Windows SDK UCRT under:"
+          Write-Host $root
+          Write-Host ""
 
-          $ucrtbase = Get-ChildItem $root `
-            -Recurse `
-            -Filter ucrtbase.dll `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.DirectoryName -match "\\arm64$"
-            } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-
-          if (-not $ucrtbase) {
-            throw "Could not find ARM64 ucrtbase.dll in Windows SDK."
+          if (-not (Test-Path $root)) {
+            throw "Windows SDK Redist directory does not exist: $root"
           }
 
-          $ucrtDir = $ucrtbase.DirectoryName
+          $ucrtDirs = Get-ChildItem $root `
+            -Directory `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match "\\ucrt\\DLLs\\arm64$"
+            } |
+            Sort-Object FullName -Descending
 
-          Write-Host "Using UCRT directory:"
-          Write-Host $ucrtDir
+          Write-Host "Possible ARM64 UCRT directories:"
+          $ucrtDirs | ForEach-Object {
+            Write-Host $_.FullName
+          }
 
-          Copy-Item "$ucrtDir\*.dll" "PKHeX-Juice\" -Force
+          $ucrtDir = $ucrtDirs | Select-Object -First 1
 
-          Write-Host "Copied UCRT DLLs:"
-          Get-ChildItem "PKHeX-Juice\api-ms-win-crt-*.dll"
-          Get-ChildItem "PKHeX-Juice\ucrtbase.dll"
+          if (-not $ucrtDir) {
+            throw "Could not find an ARM64 UCRT redistribution directory."
+          }
 
-      - name: Verify ARM64 build contents
-        shell: pwsh
-        run: |
-          Write-Host "Runtime config:"
-          Get-Content "PKHeX-Juice\PKHeX.runtimeconfig.json"
+          Write-Host ""
+          Write-Host "Using ARM64 UCRT directory:"
+          Write-Host $ucrtDir.FullName
+          Write-Host ""
 
-          Write-Host "UCRT DLL count:"
-          (Get-ChildItem "PKHeX-Juice\api-ms-win-crt-*.dll").Count
-
-      - name: Create ZIP
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path PKHeX-Juice `
-            -DestinationPath PKHeX-Juice-ARM64.zip `
+          Copy-Item `
+            "$($ucrtDir.FullName)\*.dll" `
+            "PKHeX-Juice\" `
             -Force
 
-      - uses: actions/upload-artifact@v4
+          Write-Host "Copied UCRT files."
+
+      # ------------------------------------------------------------
+      # 6. Verify the required UCRT files are actually present
+      # ------------------------------------------------------------
+      - name: Verify ARM64 UCRT files
+        shell: pwsh
+        run: |
+          $apiDlls = @(
+            Get-ChildItem `
+              "PKHeX-Juice\api-ms-win-crt-*.dll" `
+              -ErrorAction SilentlyContinue
+          )
+
+          $ucrtBase = Test-Path "PKHeX-Juice\ucrtbase.dll"
+
+          Write-Host ""
+          Write-Host "api-ms-win-crt DLL count: $($apiDlls.Count)"
+          Write-Host "ucrtbase.dll present: $ucrtBase"
+          Write-Host ""
+
+          if ($apiDlls.Count -eq 0) {
+            throw "No api-ms-win-crt DLLs were copied into PKHeX-Juice."
+          }
+
+          if (-not $ucrtBase) {
+            throw "ucrtbase.dll was not copied into PKHeX-Juice."
+          }
+
+          Write-Host "UCRT API-set files:"
+          $apiDlls |
+            Sort-Object Name |
+            Select-Object Name, Length
+
+          Write-Host ""
+          Write-Host "ucrtbase.dll:"
+          Get-Item "PKHeX-Juice\ucrtbase.dll" |
+            Select-Object Name, Length
+
+      # ------------------------------------------------------------
+      # 7. Some extra sanity checks before packaging
+      # ------------------------------------------------------------
+      - name: Verify PKHeX output
+        shell: pwsh
+        run: |
+          $required = @(
+            "PKHeX.exe",
+            "PKHeX.dll",
+            "PKHeX.runtimeconfig.json",
+            "coreclr.dll",
+            "clrjit.dll",
+            "System.Private.CoreLib.dll",
+            "ucrtbase.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "api-ms-win-crt-heap-l1-1-0.dll",
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "api-ms-win-crt-string-l1-1-0.dll",
+            "api-ms-win-crt-math-l1-1-0.dll"
+          )
+
+          $missing = @()
+
+          foreach ($file in $required) {
+            $path = Join-Path "PKHeX-Juice" $file
+
+            if (-not (Test-Path $path)) {
+              $missing += $file
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing required files:"
+            $missing | ForEach-Object {
+              Write-Host "  $_"
+            }
+
+            throw "Required files are missing."
+          }
+
+          Write-Host "All required files are present."
+
+      # ------------------------------------------------------------
+      # 8. Create ZIP
+      # ------------------------------------------------------------
+      - name: Create Juice ZIP
+        shell: pwsh
+        run: |
+          if (Test-Path "PKHeX-Juice-ARM64.zip") {
+            Remove-Item "PKHeX-Juice-ARM64.zip" -Force
+          }
+
+          Compress-Archive `
+            -Path "PKHeX-Juice" `
+            -DestinationPath "PKHeX-Juice-ARM64.zip" `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path "PKHeX-Juice-ARM64.zip")) {
+            throw "ZIP creation failed."
+          }
+
+          Write-Host ""
+          Write-Host "Created ZIP:"
+          Get-Item "PKHeX-Juice-ARM64.zip" |
+            Select-Object Name, Length
+
+      # ------------------------------------------------------------
+      # 9. Extract the ZIP again and verify the DLLs really made
+      #    it into the artifact.
+      # ------------------------------------------------------------
+      - name: Verify final ZIP contents
+        shell: pwsh
+        run: |
+          $verifyDir = "zip-verification"
+
+          if (Test-Path $verifyDir) {
+            Remove-Item $verifyDir -Recurse -Force
+          }
+
+          Expand-Archive `
+            "PKHeX-Juice-ARM64.zip" `
+            -DestinationPath $verifyDir `
+            -Force
+
+          $apiDlls = @(
+            Get-ChildItem `
+              $verifyDir `
+              -Recurse `
+              -Filter "api-ms-win-crt-*.dll" `
+              -ErrorAction SilentlyContinue
+          )
+
+          $ucrt = @(
+            Get-ChildItem `
+              $verifyDir `
+              -Recurse `
+              -Filter "ucrtbase.dll" `
+              -ErrorAction SilentlyContinue
+          )
+
+          $pkhex = @(
+            Get-ChildItem `
+              $verifyDir `
+              -Recurse `
+              -Filter "PKHeX.exe" `
+              -ErrorAction SilentlyContinue
+          )
+
+          Write-Host ""
+          Write-Host "Final ZIP verification:"
+          Write-Host "PKHeX.exe count: $($pkhex.Count)"
+          Write-Host "ucrtbase.dll count: $($ucrt.Count)"
+          Write-Host "api-ms-win-crt DLL count: $($apiDlls.Count)"
+          Write-Host ""
+
+          if ($pkhex.Count -eq 0) {
+            throw "PKHeX.exe is missing from final ZIP."
+          }
+
+          if ($ucrt.Count -eq 0) {
+            throw "ucrtbase.dll is missing from final ZIP."
+          }
+
+          if ($apiDlls.Count -eq 0) {
+            throw "api-ms-win-crt DLLs are missing from final ZIP."
+          }
+
+          Write-Host "Final ZIP contains the UCRT files:"
+          $apiDlls |
+            Sort-Object Name |
+            Select-Object Name
+
+      # ------------------------------------------------------------
+      # 10. Upload ZIP so it can be downloaded from GitHub Actions
+      # ------------------------------------------------------------
+      - name: Upload PKHeX Juice ARM64
+        uses: actions/upload-artifact@v4
         with:
           name: PKHeX-Juice-ARM64
           path: PKHeX-Juice-ARM64.zip
+          if-no-files-found: error
