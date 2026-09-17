@@ -1,3 +1,342 @@
+name: Build PKHeX for Juice ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build PKHeX ARM64 for Juice
+    runs-on: windows-latest
+
+    steps:
+      # ============================================================
+      # 1. Checkout PKHeX
+      # ============================================================
+      - name: Checkout PKHeX
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 2. Install .NET 10 SDK
+      # ============================================================
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      # ============================================================
+      # 3. Install Python for PE patching / verification
+      # ============================================================
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install pefile
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pefile
+
+      # ============================================================
+      # 4. Configure MSVC to cross-compile ARM64 Windows binaries
+      # ============================================================
+      - name: Setup MSVC ARM64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      # ============================================================
+      # 5. Publish PKHeX as self-contained Windows ARM64
+      # ============================================================
+      - name: Publish PKHeX ARM64
+        shell: pwsh
+        run: |
+          dotnet publish PKHeX.WinForms/PKHeX.WinForms.csproj `
+            -c Release `
+            -r win-arm64 `
+            --self-contained true `
+            -p:RuntimeIdentifier=win-arm64 `
+            -p:PublishSingleFile=false `
+            -p:PublishReadyToRun=false `
+            -o PKHeX-Juice
+
+          if (-not (Test-Path "PKHeX-Juice\PKHeX.exe")) {
+            throw "PKHeX.exe was not created."
+          }
+
+          Write-Host ""
+          Write-Host "PKHeX ARM64 publish completed."
+
+      # ============================================================
+      # 6. Keep the .NET 10 GC region-range workaround
+      #
+      # runtimeconfig.json form is DECIMAL:
+      # 1073741824 = 1 GiB
+      # ============================================================
+      - name: Configure .NET GC
+        shell: pwsh
+        run: |
+          $path = "PKHeX-Juice\PKHeX.runtimeconfig.json"
+
+          if (-not (Test-Path $path)) {
+            throw "PKHeX.runtimeconfig.json was not found."
+          }
+
+          $json = Get-Content $path -Raw | ConvertFrom-Json
+
+          if (-not $json.runtimeOptions) {
+            throw "runtimeOptions is missing from runtimeconfig."
+          }
+
+          if (-not $json.runtimeOptions.configProperties) {
+            $json.runtimeOptions |
+              Add-Member `
+                -MemberType NoteProperty `
+                -Name configProperties `
+                -Value ([PSCustomObject]@{})
+          }
+
+          $json.runtimeOptions.configProperties |
+            Add-Member `
+              -MemberType NoteProperty `
+              -Name "System.GC.RegionRange" `
+              -Value 1073741824 `
+              -Force
+
+          $json |
+            ConvertTo-Json -Depth 20 |
+            Set-Content $path -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "Final runtimeconfig:"
+          Get-Content $path
+
+      # ============================================================
+      # 7. Patch api-ms-win-crt-* imports to ucrtbase.dll
+      #
+      # Juice/Grape's API-set resolution was failing before .NET
+      # could start. This performs the UCRT API-set mapping directly.
+      # ============================================================
+      - name: Patch UCRT imports for Juice
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import pefile
+
+          ROOT = Path("PKHeX-Juice")
+          PREFIX = b"api-ms-win-crt-"
+          REPLACEMENT = b"ucrtbase.dll"
+
+          patched_files = 0
+          patched_imports = 0
+
+
+          def patch_name(pe, rva, old_name, path, kind):
+              global patched_imports
+
+              if not old_name.lower().startswith(PREFIX):
+                  return False
+
+              available = len(old_name) + 1
+
+              if len(REPLACEMENT) + 1 > available:
+                  raise RuntimeError(
+                      f"Replacement does not fit in {path}: {old_name!r}"
+                  )
+
+              replacement = (
+                  REPLACEMENT
+                  + b"\x00" * (available - len(REPLACEMENT))
+              )
+
+              print(
+                  f"{path.name}: [{kind}] "
+                  f"{old_name.decode(errors='replace')} "
+                  f"-> ucrtbase.dll"
+              )
+
+              pe.set_bytes_at_rva(rva, replacement)
+              patched_imports += 1
+              return True
+
+
+          pe_files = sorted(
+              list(ROOT.rglob("*.exe"))
+              + list(ROOT.rglob("*.dll"))
+          )
+
+          print(f"Scanning {len(pe_files)} PE files...")
+          print()
+
+          for path in pe_files:
+              try:
+                  pe = pefile.PE(str(path), fast_load=False)
+              except Exception:
+                  continue
+
+              changed = False
+
+              # Normal import directory
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      name = entry.dll or b""
+
+                      if name.lower().startswith(PREFIX):
+                          if patch_name(
+                              pe,
+                              int(entry.struct.Name),
+                              name,
+                              path,
+                              "IMPORT",
+                          ):
+                              changed = True
+
+              # Delay-load import directory
+              if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                      name = entry.dll or b""
+
+                      if not name.lower().startswith(PREFIX):
+                          continue
+
+                      name_value = int(entry.struct.szName)
+                      attrs = int(entry.struct.grAttrs)
+
+                      if attrs & 1:
+                          rva = name_value
+                      else:
+                          rva = (
+                              name_value
+                              - int(pe.OPTIONAL_HEADER.ImageBase)
+                          )
+
+                      if patch_name(
+                          pe,
+                          rva,
+                          name,
+                          path,
+                          "DELAY",
+                      ):
+                          changed = True
+
+              if changed:
+                  pe.write(filename=str(path))
+                  patched_files += 1
+
+              pe.close()
+
+          print()
+          print(
+              f"Patched {patched_imports} UCRT imports "
+              f"across {patched_files} PE files."
+          )
+
+          if patched_imports == 0:
+              raise RuntimeError(
+                  "No api-ms-win-crt imports were found to patch."
+              )
+          '@ | Set-Content patch_ucrt.py -Encoding UTF8
+
+          python patch_ucrt.py
+
+      # ============================================================
+      # 8. Verify no api-ms-win-crt imports remain
+      # ============================================================
+      - name: Verify patched UCRT imports
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import pefile
+          import sys
+
+          ROOT = Path("PKHeX-Juice")
+          PREFIX = b"api-ms-win-crt-"
+
+          leftovers = []
+          ucrt_users = []
+
+          pe_files = sorted(
+              list(ROOT.rglob("*.exe"))
+              + list(ROOT.rglob("*.dll"))
+          )
+
+          for path in pe_files:
+              try:
+                  pe = pefile.PE(str(path), fast_load=False)
+              except Exception:
+                  continue
+
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      name = entry.dll or b""
+                      low = name.lower()
+
+                      if low.startswith(PREFIX):
+                          leftovers.append(
+                              (
+                                  path.name,
+                                  name.decode(errors="replace"),
+                              )
+                          )
+
+                      if low == b"ucrtbase.dll":
+                          ucrt_users.append(path.name)
+
+              if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                      name = entry.dll or b""
+                      low = name.lower()
+
+                      if low.startswith(PREFIX):
+                          leftovers.append(
+                              (
+                                  path.name,
+                                  name.decode(errors="replace"),
+                              )
+                          )
+
+                      if low == b"ucrtbase.dll":
+                          ucrt_users.append(path.name)
+
+              pe.close()
+
+          if leftovers:
+              print("Remaining api-ms-win-crt imports:")
+
+              for filename, dll in leftovers:
+                  print(f"  {filename}: {dll}")
+
+              sys.exit(1)
+
+          print("Files importing ucrtbase.dll:")
+
+          for filename in sorted(set(ucrt_users)):
+              print(f"  {filename}")
+
+          print()
+          print("SUCCESS: api-ms-win-crt imports are patched.")
+          '@ | Set-Content verify_ucrt.py -Encoding UTF8
+
+          python verify_ucrt.py
+
+      # ============================================================
+      # 9. Build native ARM64 launcher
+      #
+      # The launcher:
+      #
+      #   DOTNET_PELoader_DisableMapping=1
+      #   DOTNET_ReadyToRun=0
+      #   DOTNET_GCRegionRange=40000000
+      #
+      # then launches PKHeX.exe.
+      #
+      # It deliberately does not link against the C runtime.
+      #
+      # Large buffers and Windows structures use static storage so
+      # MSVC does NOT generate a __chkstk dependency.
+      # ============================================================
       - name: Build ARM64 Juice launcher
         shell: pwsh
         run: |
@@ -6,12 +345,19 @@
           #include <windows.h>
 
           /*
-           * Static storage instead of a ~64 KiB stack allocation.
-           * This avoids MSVC generating a __chkstk dependency.
+           * Static storage avoids a ~64 KiB stack allocation and
+           * therefore avoids MSVC generating __chkstk.
            */
           static WCHAR g_path[32768];
 
           static const WCHAR g_target[] = L"PKHeX.exe";
+
+          /*
+           * Static objects are automatically zero-initialized.
+           * This also avoids compiler-generated memset calls.
+           */
+          static STARTUPINFOW g_startup;
+          static PROCESS_INFORMATION g_process;
 
           __declspec(noreturn)
           void WINAPI LauncherEntry(void)
@@ -19,13 +365,10 @@
               DWORD length;
               DWORD pos;
               DWORD j;
-
-              STARTUPINFOW startup;
-              PROCESS_INFORMATION process;
               DWORD exitCode = 255;
 
               /*
-               * Get the full path of START-PKHeX.exe.
+               * Get the full pathname of START-PKHeX.exe.
                */
               length = GetModuleFileNameW(
                   NULL,
@@ -37,7 +380,7 @@
                   ExitProcess(101);
 
               /*
-               * Locate the final directory separator.
+               * Find the final path separator.
                */
               pos = length;
 
@@ -71,7 +414,7 @@
               g_path[pos + j] = L'\0';
 
               /*
-               * Tell CoreCLR not to use its normal PE mapping path.
+               * Disable CoreCLR file mapping for non-OS PE layouts.
                */
               if (!SetEnvironmentVariableW(
                       L"DOTNET_PELoader_DisableMapping",
@@ -81,8 +424,7 @@
               }
 
               /*
-               * Disable ReadyToRun so framework code goes through
-               * the JIT rather than using precompiled R2R code.
+               * Disable use of ReadyToRun framework code.
                */
               if (!SetEnvironmentVariableW(
                       L"DOTNET_ReadyToRun",
@@ -92,6 +434,9 @@
               }
 
               /*
+               * GC region range.
+               *
+               * Environment-variable form is hexadecimal:
                * 0x40000000 = 1 GiB.
                */
               if (!SetEnvironmentVariableW(
@@ -102,14 +447,18 @@
               }
 
               /*
-               * Initialize STARTUPINFO without the C runtime.
+               * STARTUPINFO must contain its structure size.
+               *
+               * Everything else is already zero because this is
+               * static storage.
                */
-              GetStartupInfoW(&startup);
+              g_startup.cb = sizeof(g_startup);
 
               /*
                * Start PKHeX.exe.
                *
-               * The environment variables above are inherited.
+               * The environment variables set above are inherited
+               * automatically by the child process.
                */
               if (!CreateProcessW(
                       g_path,
@@ -120,32 +469,33 @@
                       0,
                       NULL,
                       NULL,
-                      &startup,
-                      &process))
+                      &g_startup,
+                      &g_process))
               {
                   ExitProcess(120);
               }
 
               /*
-               * Wait for PKHeX to exit.
+               * Wait for PKHeX.exe to exit.
                */
               WaitForSingleObject(
-                  process.hProcess,
+                  g_process.hProcess,
                   INFINITE
               );
 
               GetExitCodeProcess(
-                  process.hProcess,
+                  g_process.hProcess,
                   &exitCode
               );
 
-              CloseHandle(process.hThread);
-              CloseHandle(process.hProcess);
+              CloseHandle(g_process.hThread);
+              CloseHandle(g_process.hProcess);
 
               ExitProcess(exitCode);
           }
           '@ | Set-Content juice_launcher.c -Encoding ASCII
 
+          Write-Host ""
           Write-Host "Compiling ARM64 launcher..."
 
           cl.exe `
@@ -186,5 +536,247 @@
 
           Write-Host ""
           Write-Host "Launcher created successfully:"
+
           Get-Item "PKHeX-Juice\START-PKHeX.exe" |
             Select-Object Name, Length
+
+      # ============================================================
+      # 10. Verify PKHeX.exe and START-PKHeX.exe are ARM64
+      #
+      # Also verify the launcher did not gain a CRT dependency.
+      # ============================================================
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          @'
+          import pefile
+
+          files = [
+              "PKHeX-Juice/PKHeX.exe",
+              "PKHeX-Juice/START-PKHeX.exe",
+          ]
+
+          for path in files:
+              pe = pefile.PE(path)
+
+              machine = pe.FILE_HEADER.Machine
+
+              print(
+                  f"{path}: machine=0x{machine:04X}"
+              )
+
+              if machine != 0xAA64:
+                  raise RuntimeError(
+                      f"{path} is not ARM64."
+                  )
+
+              imports = []
+
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      imports.append(
+                          entry.dll.decode(
+                              errors="replace"
+                          )
+                      )
+
+              print(f"{path} imports:")
+
+              for dll in imports:
+                  print(f"  {dll}")
+
+              if path.endswith("START-PKHeX.exe"):
+                  bad = [
+                      dll
+                      for dll in imports
+                      if dll.lower().startswith(
+                          "api-ms-win-crt-"
+                      )
+                  ]
+
+                  if bad:
+                      raise RuntimeError(
+                          "Launcher unexpectedly depends on "
+                          "UCRT API-set DLLs: "
+                          + ", ".join(bad)
+                      )
+
+              pe.close()
+
+          print()
+          print("ARM64 verification passed.")
+          '@ | Set-Content verify_arch.py -Encoding UTF8
+
+          python verify_arch.py
+
+      # ============================================================
+      # 11. Verify essential .NET/PKHeX files
+      # ============================================================
+      - name: Verify package contents
+        shell: pwsh
+        run: |
+          $required = @(
+            "START-PKHeX.exe",
+            "PKHeX.exe",
+            "PKHeX.dll",
+            "PKHeX.runtimeconfig.json",
+            "coreclr.dll",
+            "clrjit.dll",
+            "hostfxr.dll",
+            "hostpolicy.dll",
+            "System.Private.CoreLib.dll"
+          )
+
+          foreach ($file in $required) {
+            $path = Join-Path "PKHeX-Juice" $file
+
+            if (-not (Test-Path $path)) {
+              throw "Missing required file: $file"
+            }
+
+            Write-Host "OK: $file"
+          }
+
+      # ============================================================
+      # 12. Remove createdump.exe
+      #
+      # It isn't useful for this experiment and removing it makes
+      # Juice's executable picker less confusing.
+      # ============================================================
+      - name: Remove unnecessary createdump
+        shell: pwsh
+        run: |
+          $createdump = "PKHeX-Juice\createdump.exe"
+
+          if (Test-Path $createdump) {
+            Remove-Item $createdump -Force
+            Write-Host "Removed createdump.exe"
+          } else {
+            Write-Host "createdump.exe was not present."
+          }
+
+      # ============================================================
+      # 13. List executables that Juice will see
+      # ============================================================
+      - name: List final executables
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "Executables in package:"
+
+          Get-ChildItem "PKHeX-Juice" `
+            -Filter "*.exe" |
+            Select-Object Name, Length
+
+          Write-Host ""
+          Write-Host "IMPORTANT:"
+          Write-Host "In Juice, select START-PKHeX.exe"
+          Write-Host "Do NOT select PKHeX.exe directly."
+
+      # ============================================================
+      # 14. Create Juice ZIP
+      # ============================================================
+      - name: Create Juice ZIP
+        shell: pwsh
+        run: |
+          $zip = "PKHeX-Juice-ARM64.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          Compress-Archive `
+            -Path "PKHeX-Juice" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path $zip)) {
+            throw "ZIP creation failed."
+          }
+
+          Write-Host ""
+          Write-Host "Created ZIP:"
+
+          Get-Item $zip |
+            Select-Object Name, Length
+
+      # ============================================================
+      # 15. Extract ZIP again and verify final artifact contents
+      # ============================================================
+      - name: Verify final ZIP
+        shell: pwsh
+        run: |
+          $verify = "ZIP-VERIFY"
+
+          if (Test-Path $verify) {
+            Remove-Item $verify -Recurse -Force
+          }
+
+          Expand-Archive `
+            "PKHeX-Juice-ARM64.zip" `
+            -DestinationPath $verify `
+            -Force
+
+          $launcher = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "START-PKHeX.exe"
+          )
+
+          $pkhex = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "PKHeX.exe"
+          )
+
+          $coreclr = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "coreclr.dll"
+          )
+
+          $corelib = @(
+            Get-ChildItem `
+              $verify `
+              -Recurse `
+              -Filter "System.Private.CoreLib.dll"
+          )
+
+          Write-Host ""
+          Write-Host "Final ZIP verification:"
+          Write-Host "START-PKHeX.exe:          $($launcher.Count)"
+          Write-Host "PKHeX.exe:                $($pkhex.Count)"
+          Write-Host "coreclr.dll:              $($coreclr.Count)"
+          Write-Host "System.Private.CoreLib:   $($corelib.Count)"
+          Write-Host ""
+
+          if ($launcher.Count -ne 1) {
+            throw "START-PKHeX.exe missing from ZIP."
+          }
+
+          if ($pkhex.Count -ne 1) {
+            throw "PKHeX.exe missing from ZIP."
+          }
+
+          if ($coreclr.Count -ne 1) {
+            throw "coreclr.dll missing from ZIP."
+          }
+
+          if ($corelib.Count -ne 1) {
+            throw "System.Private.CoreLib.dll missing from ZIP."
+          }
+
+          Write-Host "Final ZIP verification passed."
+
+      # ============================================================
+      # 16. Upload final artifact
+      # ============================================================
+      - name: Upload PKHeX Juice ARM64
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKHeX-Juice-ARM64
+          path: PKHeX-Juice-ARM64.zip
+          if-no-files-found: error
