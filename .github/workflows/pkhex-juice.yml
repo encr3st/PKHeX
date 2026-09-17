@@ -24,7 +24,21 @@ jobs:
           dotnet-version: '10.0.x'
 
       # ------------------------------------------------------------
-      # 3. Publish self-contained Windows ARM64 PKHeX
+      # 3. Install Python for PE patching
+      # ------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install pefile
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pefile
+
+      # ------------------------------------------------------------
+      # 4. Publish PKHeX as self-contained Windows ARM64
       # ------------------------------------------------------------
       - name: Publish PKHeX ARM64
         shell: pwsh
@@ -43,10 +57,12 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "PKHeX ARM64 publish completed."
+          Write-Host "ARM64 publish completed."
 
       # ------------------------------------------------------------
-      # 4. Reduce CoreCLR GC virtual address reservation
+      # 5. Reduce .NET GC virtual-address reservation
+      #
+      # Retains the workaround from the earlier x64/CoreCLR problem.
       # ------------------------------------------------------------
       - name: Configure .NET GC for Juice
         shell: pwsh
@@ -79,233 +95,278 @@ jobs:
             Set-Content $path -Encoding UTF8
 
           Write-Host ""
-          Write-Host "Updated runtimeconfig:"
+          Write-Host "Updated runtime configuration:"
           Get-Content $path
 
       # ------------------------------------------------------------
-      # 5. Download an official Microsoft ARM64 Windows SDK package.
+      # 6. Patch UCRT API-set imports
       #
-      # We deliberately use SDK 10.0.22621.1 rather than relying on
-      # the SDK installed on the GitHub runner.
-      # ------------------------------------------------------------
-      - name: Download ARM64 Windows SDK package
-        shell: pwsh
-        run: |
-          $sdkVersion = "10.0.22621.1"
-
-          New-Item `
-            -ItemType Directory `
-            -Path "WindowsSDK-NuGet" `
-            -Force | Out-Null
-
-          nuget install Microsoft.Windows.SDK.CPP.arm64 `
-            -Version $sdkVersion `
-            -OutputDirectory "WindowsSDK-NuGet" `
-            -DirectDownload `
-            -NonInteractive
-
-          Write-Host ""
-          Write-Host "Downloaded SDK packages:"
-
-          Get-ChildItem "WindowsSDK-NuGet" -Directory |
-            Select-Object FullName
-
-      # ------------------------------------------------------------
-      # 6. Locate the ARM64 UCRT redistributable inside the NuGet
-      #    package by looking for the API-set DLL itself.
+      # Juice/Grape is failing its API-set schema resolution.
       #
-      # We do NOT assume a particular internal package directory.
+      # Wine's own API-set table maps all api-ms-win-crt-* contracts
+      # to ucrtbase.dll, so we perform that mapping directly in the
+      # PE import tables.
+      #
+      # This patches ALL EXEs and DLLs in the self-contained publish,
+      # not just PKHeX.exe, because hostfxr/coreclr/etc. may also
+      # reference UCRT API-set names.
       # ------------------------------------------------------------
-      - name: Find ARM64 UCRT in SDK package
+      - name: Patch UCRT imports for Juice
         shell: pwsh
         run: |
-          $armPackage = Get-ChildItem `
-            "WindowsSDK-NuGet" `
-            -Directory |
-            Where-Object {
-              $_.Name -like "Microsoft.Windows.SDK.CPP.arm64.*"
-            } |
-            Select-Object -First 1
+          @'
+          from pathlib import Path
+          import pefile
+          import sys
 
-          if (-not $armPackage) {
-            throw "Microsoft.Windows.SDK.CPP.arm64 package directory was not found."
-          }
+          ROOT = Path("PKHeX-Juice")
 
-          Write-Host "ARM64 SDK package:"
-          Write-Host $armPackage.FullName
-          Write-Host ""
+          PREFIX = b"api-ms-win-crt-"
+          REPLACEMENT = b"ucrtbase.dll"
 
-          $runtimeForwarder = Get-ChildItem `
-            $armPackage.FullName `
-            -Recurse `
-            -File `
-            -Filter "api-ms-win-crt-runtime-l1-1-0.dll" `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          patched_files = 0
+          patched_imports = 0
 
-          if (-not $runtimeForwarder) {
-            Write-Host ""
-            Write-Host "DLL directories found in package:"
 
-            Get-ChildItem `
-              $armPackage.FullName `
-              -Recurse `
-              -File `
-              -Filter "*.dll" `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 100 FullName
+          def patch_name(pe, rva, old_name, path, kind):
+              global patched_imports
 
-            throw "ARM64 UCRT API-set forwarders were not found in the SDK NuGet package."
-          }
+              if rva is None:
+                  return False
 
-          $ucrtDir = $runtimeForwarder.Directory.FullName
+              if not old_name.lower().startswith(PREFIX):
+                  return False
 
-          Write-Host "Found UCRT directory:"
-          Write-Host $ucrtDir
-          Write-Host ""
+              # Include the terminating NUL belonging to the
+              # original DLL name.
+              available = len(old_name) + 1
 
-          # Save path for later steps.
-          $ucrtDir | Out-File `
-            -FilePath "ucrt-directory.txt" `
-            -Encoding ascii
+              replacement = (
+                  REPLACEMENT +
+                  b"\x00" * (available - len(REPLACEMENT))
+              )
 
-          Write-Host "Contents:"
-          Get-ChildItem $ucrtDir |
-            Sort-Object Name |
-            Select-Object Name, Length
+              if len(REPLACEMENT) + 1 > available:
+                  raise RuntimeError(
+                      f"Replacement will not fit in {path}: "
+                      f"{old_name!r}"
+                  )
+
+              print(
+                  f"{path.name}: [{kind}] "
+                  f"{old_name.decode(errors='replace')} "
+                  f"-> ucrtbase.dll"
+              )
+
+              pe.set_bytes_at_rva(rva, replacement)
+              patched_imports += 1
+              return True
+
+
+          pe_files = sorted(
+              list(ROOT.rglob("*.exe")) +
+              list(ROOT.rglob("*.dll"))
+          )
+
+          print(f"Scanning {len(pe_files)} PE files...")
+          print()
+
+          for path in pe_files:
+              try:
+                  pe = pefile.PE(str(path), fast_load=False)
+              except Exception:
+                  continue
+
+              changed = False
+
+              # -------------------------------
+              # Normal import directory
+              # -------------------------------
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      name = entry.dll
+
+                      if not name:
+                          continue
+
+                      if name.lower().startswith(PREFIX):
+                          rva = int(entry.struct.Name)
+
+                          if patch_name(
+                              pe,
+                              rva,
+                              name,
+                              path,
+                              "IMPORT"
+                          ):
+                              changed = True
+
+              # -------------------------------
+              # Delay-load import directory
+              # -------------------------------
+              if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                      name = entry.dll
+
+                      if not name:
+                          continue
+
+                      if not name.lower().startswith(PREFIX):
+                          continue
+
+                      name_value = int(entry.struct.szName)
+
+                      # Modern delay-import descriptors normally
+                      # contain RVAs when bit 0 of grAttrs is set.
+                      attrs = int(entry.struct.grAttrs)
+
+                      if attrs & 1:
+                          rva = name_value
+                      else:
+                          rva = (
+                              name_value -
+                              int(pe.OPTIONAL_HEADER.ImageBase)
+                          )
+
+                      if patch_name(
+                          pe,
+                          rva,
+                          name,
+                          path,
+                          "DELAY"
+                      ):
+                          changed = True
+
+              if changed:
+                  pe.write(filename=str(path))
+                  patched_files += 1
+
+              pe.close()
+
+          print()
+          print(
+              f"Patched {patched_imports} UCRT imports "
+              f"across {patched_files} PE files."
+          )
+
+          if patched_imports == 0:
+              raise RuntimeError(
+                  "No api-ms-win-crt imports were found to patch."
+              )
+          '@ | Set-Content patch_ucrt.py -Encoding UTF8
+
+          python patch_ucrt.py
 
       # ------------------------------------------------------------
-      # 7. Copy the complete ARM64 app-local UCRT next to PKHeX.
+      # 7. Verify no api-ms-win-crt imports remain
       # ------------------------------------------------------------
-      - name: Add ARM64 Universal CRT to PKHeX
+      - name: Verify patched imports
         shell: pwsh
         run: |
-          $ucrtDir = (
-            Get-Content "ucrt-directory.txt" -Raw
-          ).Trim()
+          @'
+          from pathlib import Path
+          import pefile
+          import sys
 
-          if (-not (Test-Path $ucrtDir)) {
-            throw "Saved UCRT directory does not exist: $ucrtDir"
-          }
+          ROOT = Path("PKHeX-Juice")
+          PREFIX = b"api-ms-win-crt-"
 
-          Write-Host "Copying UCRT from:"
-          Write-Host $ucrtDir
-          Write-Host ""
+          leftovers = []
+          ucrt_imports = []
 
-          Copy-Item `
-            "$ucrtDir\*.dll" `
-            "PKHeX-Juice\" `
-            -Force
+          pe_files = sorted(
+              list(ROOT.rglob("*.exe")) +
+              list(ROOT.rglob("*.dll"))
+          )
 
-          Write-Host "Copy complete."
+          for path in pe_files:
+              try:
+                  pe = pefile.PE(str(path), fast_load=False)
+              except Exception:
+                  continue
+
+              if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      name = entry.dll or b""
+                      low = name.lower()
+
+                      if low.startswith(PREFIX):
+                          leftovers.append(
+                              (path.name, name.decode(errors="replace"))
+                          )
+
+                      if low == b"ucrtbase.dll":
+                          ucrt_imports.append(path.name)
+
+              if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                  for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                      name = entry.dll or b""
+                      low = name.lower()
+
+                      if low.startswith(PREFIX):
+                          leftovers.append(
+                              (path.name, name.decode(errors="replace"))
+                          )
+
+                      if low == b"ucrtbase.dll":
+                          ucrt_imports.append(path.name)
+
+              pe.close()
+
+          print()
+          print("Files now importing ucrtbase.dll:")
+          for name in sorted(set(ucrt_imports)):
+              print(f"  {name}")
+
+          print()
+
+          if leftovers:
+              print("ERROR: Remaining api-ms-win-crt imports:")
+
+              for file, dll in leftovers:
+                  print(f"  {file}: {dll}")
+
+              sys.exit(1)
+
+          if not ucrt_imports:
+              print("ERROR: No ucrtbase.dll imports found after patch.")
+              sys.exit(1)
+
+          print("SUCCESS: No api-ms-win-crt imports remain.")
+          '@ | Set-Content verify_ucrt.py -Encoding UTF8
+
+          python verify_ucrt.py
 
       # ------------------------------------------------------------
-      # 8. Verify that the API-set DLLs now REALLY exist.
+      # 8. Verify PKHeX.exe is ARM64
       # ------------------------------------------------------------
-      - name: Verify ARM64 UCRT files
+      - name: Verify PKHeX architecture
         shell: pwsh
         run: |
-          $apiDlls = @(
-            Get-ChildItem `
-              "PKHeX-Juice\api-ms-win-*.dll" `
-              -ErrorAction SilentlyContinue
-          )
+          @'
+          import pefile
 
-          $crtDlls = @(
-            Get-ChildItem `
-              "PKHeX-Juice\api-ms-win-crt-*.dll" `
-              -ErrorAction SilentlyContinue
-          )
+          pe = pefile.PE("PKHeX-Juice/PKHeX.exe")
 
-          $ucrtBase = Test-Path "PKHeX-Juice\ucrtbase.dll"
+          machine = pe.FILE_HEADER.Machine
 
-          Write-Host ""
-          Write-Host "All API-set DLL count: $($apiDlls.Count)"
-          Write-Host "CRT API-set DLL count: $($crtDlls.Count)"
-          Write-Host "ucrtbase.dll present: $ucrtBase"
-          Write-Host ""
+          print(f"PKHeX.exe machine: 0x{machine:04X}")
 
-          if ($crtDlls.Count -eq 0) {
-            throw "No api-ms-win-crt DLLs exist in PKHeX-Juice."
-          }
+          # IMAGE_FILE_MACHINE_ARM64
+          if machine != 0xAA64:
+              raise RuntimeError(
+                  f"PKHeX.exe is not ARM64: 0x{machine:04X}"
+              )
 
-          if (-not $ucrtBase) {
-            throw "ucrtbase.dll does not exist in PKHeX-Juice."
-          }
+          print("PKHeX.exe is ARM64.")
+          '@ | Set-Content verify_arch.py -Encoding UTF8
 
-          $required = @(
-            "api-ms-win-crt-runtime-l1-1-0.dll",
-            "api-ms-win-crt-heap-l1-1-0.dll",
-            "api-ms-win-crt-time-l1-1-0.dll",
-            "api-ms-win-crt-stdio-l1-1-0.dll",
-            "api-ms-win-crt-locale-l1-1-0.dll",
-            "api-ms-win-crt-string-l1-1-0.dll",
-            "api-ms-win-crt-convert-l1-1-0.dll",
-            "api-ms-win-crt-math-l1-1-0.dll"
-          )
-
-          foreach ($dll in $required) {
-            $path = Join-Path "PKHeX-Juice" $dll
-
-            if (-not (Test-Path $path)) {
-              throw "Required UCRT forwarder is missing: $dll"
-            }
-
-            Write-Host "OK: $dll"
-          }
-
-          Write-Host ""
-          Write-Host "All UCRT DLL checks passed."
+          python verify_arch.py
 
       # ------------------------------------------------------------
-      # 9. Verify the copied DLLs are ARM64 PE files.
+      # 9. Verify essential .NET files
       # ------------------------------------------------------------
-      - name: Verify UCRT architecture
-        shell: pwsh
-        run: |
-          function Get-PEMachine {
-            param([string]$Path)
-
-            $stream = [System.IO.File]::OpenRead($Path)
-
-            try {
-              $reader = New-Object System.IO.BinaryReader($stream)
-
-              $stream.Position = 0x3C
-              $peOffset = $reader.ReadInt32()
-
-              $stream.Position = $peOffset + 4
-              return $reader.ReadUInt16()
-            }
-            finally {
-              $stream.Dispose()
-            }
-          }
-
-          $files = @(
-            "PKHeX-Juice\ucrtbase.dll",
-            "PKHeX-Juice\api-ms-win-crt-runtime-l1-1-0.dll",
-            "PKHeX-Juice\api-ms-win-crt-heap-l1-1-0.dll"
-          )
-
-          foreach ($file in $files) {
-            $machine = Get-PEMachine $file
-
-            Write-Host "$file machine = 0x$($machine.ToString('X4'))"
-
-            # IMAGE_FILE_MACHINE_ARM64 = 0xAA64
-            if ($machine -ne 0xAA64) {
-              throw "$file is not ARM64."
-            }
-          }
-
-          Write-Host ""
-          Write-Host "UCRT architecture verification passed."
-
-      # ------------------------------------------------------------
-      # 10. Verify the important .NET/PKHeX files.
-      # ------------------------------------------------------------
-      - name: Verify PKHeX package
+      - name: Verify publish contents
         shell: pwsh
         run: |
           $required = @(
@@ -314,9 +375,9 @@ jobs:
             "PKHeX.runtimeconfig.json",
             "coreclr.dll",
             "clrjit.dll",
-            "System.Private.CoreLib.dll",
-            "ucrtbase.dll",
-            "api-ms-win-crt-runtime-l1-1-0.dll"
+            "hostfxr.dll",
+            "hostpolicy.dll",
+            "System.Private.CoreLib.dll"
           )
 
           foreach ($file in $required) {
@@ -330,7 +391,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 11. Create final ZIP.
+      # 10. Create ZIP
       # ------------------------------------------------------------
       - name: Create Juice ZIP
         shell: pwsh
@@ -350,11 +411,12 @@ jobs:
             throw "ZIP creation failed."
           }
 
+          Write-Host ""
           Get-Item $zip |
             Select-Object Name, Length
 
       # ------------------------------------------------------------
-      # 12. Extract ZIP again and verify its actual contents.
+      # 11. Verify ZIP after extraction
       # ------------------------------------------------------------
       - name: Verify final ZIP
         shell: pwsh
@@ -370,52 +432,33 @@ jobs:
             -DestinationPath $verify `
             -Force
 
-          $crtDlls = @(
-            Get-ChildItem `
-              $verify `
-              -Recurse `
-              -Filter "api-ms-win-crt-*.dll"
-          )
+          $exe = Get-ChildItem `
+            $verify `
+            -Recurse `
+            -Filter "PKHeX.exe"
 
-          $pkhex = @(
-            Get-ChildItem `
-              $verify `
-              -Recurse `
-              -Filter "PKHeX.exe"
-          )
-
-          $ucrt = @(
-            Get-ChildItem `
-              $verify `
-              -Recurse `
-              -Filter "ucrtbase.dll"
-          )
+          $coreclr = Get-ChildItem `
+            $verify `
+            -Recurse `
+            -Filter "coreclr.dll"
 
           Write-Host ""
-          Write-Host "FINAL ZIP:"
-          Write-Host "PKHeX.exe: $($pkhex.Count)"
-          Write-Host "ucrtbase.dll: $($ucrt.Count)"
-          Write-Host "api-ms-win-crt DLLs: $($crtDlls.Count)"
-          Write-Host ""
+          Write-Host "Final ZIP:"
+          Write-Host "PKHeX.exe count: $($exe.Count)"
+          Write-Host "coreclr.dll count: $($coreclr.Count)"
 
-          if ($pkhex.Count -ne 1) {
+          if ($exe.Count -ne 1) {
             throw "PKHeX.exe missing from ZIP."
           }
 
-          if ($ucrt.Count -eq 0) {
-            throw "ucrtbase.dll missing from ZIP."
+          if ($coreclr.Count -ne 1) {
+            throw "coreclr.dll missing from ZIP."
           }
 
-          if ($crtDlls.Count -eq 0) {
-            throw "api-ms-win-crt DLLs missing from ZIP."
-          }
-
-          $crtDlls |
-            Sort-Object Name |
-            Select-Object Name
+          Write-Host "ZIP verification passed."
 
       # ------------------------------------------------------------
-      # 13. Upload final Juice package.
+      # 12. Upload
       # ------------------------------------------------------------
       - name: Upload PKHeX Juice ARM64
         uses: actions/upload-artifact@v4
